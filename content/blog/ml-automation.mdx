@@ -1,0 +1,149 @@
+---
+title: "ML Automation for Developers: AI Workflows That Work"
+description: "How to automate the repetitive parts of the ML lifecycle — retraining, evaluation, and inference pipelines — using tools developers already know."
+date: "2026-05-26"
+tags: ["ml-automation", "mlops", "machine-learning", "workflow"]
+---
+
+The first version of any ML system is built by hand: someone runs a notebook,
+copies a model file, and wires up an endpoint. That's fine — until you're doing
+it every week, by hand, at 11pm, because the model drifted again. Automation is
+what turns a one-off model into a system that maintains itself.
+
+This guide covers what's actually worth automating in the ML lifecycle, and the
+tools developers can reach for without becoming full-time MLOps engineers.
+
+## What to automate (and what not to)
+
+Not everything benefits from automation. The rule of thumb: automate the
+**repetitive and well-defined**, keep humans on the **judgment calls**.
+
+Worth automating:
+
+- **Retraining** on a schedule or a data trigger
+- **Evaluation** — running a fixed test suite against every new model
+- **Deployment** of a model that passes evaluation
+- **Inference pipelines** — the data-in, prediction-out plumbing
+- **Monitoring** for drift and performance regressions
+
+Keep manual (for now):
+
+- Deciding *what* metric matters
+- Approving a model that changes behavior for users
+- Responding to a genuine drift event (the detection is automated; the fix is judgment)
+
+## The automation maturity ladder
+
+Most teams climb these rungs in order. Find your rung and take the next step —
+skipping ahead usually backfires.
+
+1. **Scripted.** The whole pipeline runs from one command. No more notebook
+   archaeology. This alone removes most 11pm incidents.
+2. **Scheduled.** That command runs on a cron or CI schedule.
+3. **Triggered.** Retraining fires on an event — new data landing, a drift
+   alert — not just a clock.
+4. **Gated.** New models auto-deploy *only* if they beat the current one on your
+   evaluation suite.
+5. **Self-healing.** Drift detection triggers retraining, evaluation gates the
+   result, and deployment happens without a human in the common case.
+
+## Tooling, by job
+
+You don't need a monolithic ML platform. Compose tools you already understand.
+
+### Orchestration: start with what you have
+
+For many teams, **GitHub Actions** or **GitLab CI** is a perfectly good ML
+orchestrator. A scheduled workflow that pulls data, retrains, evaluates, and
+publishes an artifact covers rungs 1–4 with zero new infrastructure:
+
+```yaml
+name: retrain
+on:
+  schedule:
+    - cron: "0 3 * * 1"   # Mondays at 03:00 UTC
+  workflow_dispatch: {}    # allow manual runs
+jobs:
+  retrain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python train.py --output model.onnx
+      - run: python evaluate.py --model model.onnx --min-accuracy 0.92
+      - uses: actions/upload-artifact@v4
+        with:
+          name: model
+          path: model.onnx
+```
+
+When you outgrow CI — complex DAGs, backfills, data dependencies — graduate to a
+dedicated orchestrator like **Prefect**, **Dagster**, or **Airflow**.
+
+### The evaluation gate
+
+The single highest-leverage piece of automation is the gate that refuses to ship
+a worse model. Make `evaluate.py` exit non-zero when the model underperforms,
+and your pipeline simply won't promote it:
+
+```python
+import sys
+
+accuracy = run_eval(model_path)
+threshold = 0.92
+
+print(f"accuracy={accuracy:.4f} threshold={threshold}")
+if accuracy < threshold:
+    print("Model failed evaluation gate — not promoting.")
+    sys.exit(1)
+```
+
+This is the same discipline as a failing test blocking a deploy — applied to
+models instead of code.
+
+### No-code glue: n8n and Make
+
+For the connective tissue around the pipeline — "when a new file lands in this
+bucket, kick off retraining and post to Slack" — visual tools like **n8n**
+(self-hostable, open source) or **Make** are faster than writing webhook
+handlers. Use them for event routing and notifications, not for the ML compute
+itself.
+
+### Inference pipelines
+
+Once a model passes the gate, the inference path should be boring and
+automatic. Wrap the model in a small service, version it alongside the model
+artifact, and deploy on push. The mechanics of exporting and serving a portable
+model are covered in [Getting Started with ONNX](/blog/getting-started-onnx);
+the production serving patterns are in
+[Production ML Workflows](/blog/production-workflows).
+
+## A realistic starting point
+
+If you automate exactly one thing this quarter, make it **rung 4**: a scheduled
+retrain with an evaluation gate. It's a day or two of work with tools you
+already have, and it eliminates the two worst failure modes — stale models and
+silently-worse deployments.
+
+## Measuring the payoff
+
+Automation earns its keep in time and risk, not novelty. Track:
+
+- **Hours saved per retraining cycle** (the obvious one)
+- **Time-to-recovery** after drift — how fast a fix ships once detected
+- **Bad deploys prevented** by the evaluation gate
+
+If those numbers aren't moving, you've automated the wrong thing — step back to
+the maturity ladder and pick the rung that actually hurts.
+
+## Conclusion
+
+ML automation isn't about adopting a heavyweight platform. It's about climbing
+one rung at a time: script it, schedule it, gate it. Start with a scheduled
+retrain behind an evaluation gate using CI you already run, and add
+orchestration only when complexity demands it. The goal is a system that keeps
+its own models fresh and refuses to ship worse ones — so you can spend your time
+on the judgment calls that actually need a human.

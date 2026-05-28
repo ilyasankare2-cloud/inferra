@@ -1,0 +1,129 @@
+---
+title: "AutoML vs Custom Models: When to Use Each"
+description: "A decision framework for choosing between AutoML platforms and hand-built models — covering cost, control, accuracy, and the trade-offs that actually matter in production."
+date: "2026-05-27"
+tags: ["automl", "machine-learning", "model-selection", "mlops"]
+---
+
+"Should we use AutoML or build a custom model?" is one of the first real
+decisions on any ML project, and it's often answered by reflex rather than
+reasoning. Engineers reach for custom models because building them is the fun
+part; managers reach for AutoML because it promises to skip the hard part.
+Both reflexes are wrong about half the time.
+
+This guide gives you a decision framework instead of a default.
+
+## What each approach actually is
+
+**AutoML** automates the model-building pipeline: feature preprocessing,
+model selection, and hyperparameter tuning. You provide labeled data and a
+target metric; the platform searches a space of models and returns the best one
+it found. Examples include Google Vertex AI AutoML, AWS SageMaker Autopilot,
+Azure AutoML, and open-source options like H2O AutoML and AutoGluon.
+
+**Custom models** are the traditional path: you choose the architecture, write
+the training code, engineer features, and own every knob. This is everything
+from a hand-tuned gradient-boosted tree to a bespoke neural network.
+
+The important framing: these aren't opposites on a quality axis. They're
+different trade-offs on a **control-versus-effort** axis.
+
+## The decision framework
+
+Run your project through these five questions before writing any code.
+
+### 1. How standard is your problem?
+
+AutoML shines on well-trodden problem shapes: tabular classification and
+regression, standard image classification, basic forecasting. If your problem
+looks like a Kaggle competition, AutoML will likely get you 90% of the way fast.
+
+If your problem is unusual — custom loss functions, multi-modal inputs, unusual
+output structures, hard latency budgets — AutoML's search space probably doesn't
+contain your answer. Build custom.
+
+### 2. How much do you understand your data?
+
+AutoML is a force multiplier for people who understand their data and a
+foot-gun for people who don't. It will happily optimize a metric on leaky
+features and hand you a model that looks brilliant offline and fails in
+production. If you can't yet articulate what a good feature looks like for your
+problem, that's a data-understanding gap no platform fixes.
+
+### 3. What are your latency and deployment constraints?
+
+This is where teams get surprised. An AutoML model optimized purely for accuracy
+can be an ensemble that's expensive to serve. If you need single-digit
+millisecond inference, or on-device deployment, the *deployability* of the model
+matters as much as its accuracy.
+
+A custom model gives you control over size and latency. And whichever you
+choose, exporting to a portable format keeps your options open — see
+[Getting Started with ONNX](/blog/getting-started-onnx) for how to decouple the
+trained model from the serving runtime.
+
+### 4. What's the real cost — including people?
+
+The honest cost comparison isn't "AutoML compute bill vs. free custom code."
+It's:
+
+- **AutoML:** platform/compute cost + the engineer-hours to wire up data and
+  evaluate results. Low upfront, but recurring per-training and per-prediction
+  costs add up at scale.
+- **Custom:** mostly engineer-hours upfront, lower marginal serving cost if you
+  optimize. Higher fixed cost, better unit economics at volume.
+
+Cheap experiments favor AutoML. High-volume, long-lived systems often favor a
+custom model you fully control.
+
+### 5. Who maintains it in six months?
+
+A custom model is a custom maintenance burden. An AutoML pipeline is a
+dependency on a vendor's roadmap and pricing. Neither is free. Ask which kind of
+debt your team is better equipped to carry.
+
+## A quick decision table
+
+| Signal | Lean AutoML | Lean Custom |
+|---|---|---|
+| Problem type | Standard tabular/vision | Novel or multi-modal |
+| Team ML depth | Limited | Strong |
+| Latency budget | Relaxed | Tight / on-device |
+| Time to first result | Days | Weeks |
+| Volume / unit economics | Low–medium | High |
+| Need full control | No | Yes |
+
+## A pragmatic hybrid
+
+The best teams rarely pick one forever. A common, effective pattern:
+
+1. **Start with AutoML as a baseline.** It's the fastest way to learn whether
+   the problem is even tractable and what accuracy is achievable.
+2. **Use it to set the bar.** If AutoML hits your target, you may be done.
+3. **Go custom only to beat it.** If you need more — lower latency, higher
+   accuracy, tighter cost — build a custom model that has to *beat the AutoML
+   baseline* to justify itself.
+
+This turns "AutoML vs custom" into a sequence rather than a fork, and it keeps
+you honest: every custom model now has a number to beat.
+
+## Common mistakes
+
+- **Treating AutoML accuracy as free.** A model you can't deploy within budget
+  isn't a solution.
+- **Building custom for ego.** If a baseline platform meets the requirement,
+  the custom model is cost without benefit.
+- **Ignoring data leakage.** Both approaches fail the same way here; AutoML just
+  fails faster and more confidently.
+
+## Conclusion
+
+AutoML and custom models aren't competitors — they're tools with different
+cost structures. Use AutoML to move fast and establish a baseline on standard
+problems. Reach for a custom model when control, latency, unit economics, or
+problem novelty demand it. And when in doubt, run AutoML first so your custom
+work has a target worth beating.
+
+Whichever you ship, the deployment story is the same set of concerns. If you're
+taking a model to production next, [Production ML Workflows](/blog/production-workflows)
+covers the path from a trained artifact to a scaled serving API.
