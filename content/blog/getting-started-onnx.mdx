@@ -204,8 +204,9 @@ Where you run the `.onnx` file is the whole point of the format:
   over HTTP. This is the most common production pattern, and the subject of a
   dedicated walkthrough in [Production ML Workflows](/blog/production-workflows).
 - **Edge and mobile.** ORT Mobile and ONNX Runtime Web let the same model run
-  on-device — no network round trip, better privacy, lower latency. See
-  [Edge ML Deployment](/blog/edge-ml-deployment) for the device-side details.
+  on-device — no network round trip, better privacy, lower latency. Whether
+  that's the right call over a serving API is its own decision, covered in
+  [Server-Side vs On-Device ML Inference](/blog/server-side-vs-on-device-inference).
 - **Browser.** `onnxruntime-web` runs models client-side via WebAssembly or
   WebGPU.
 
@@ -225,7 +226,8 @@ framework your team prefers, export once, and run that same artifact on a
 server, a phone, or in a browser — with ONNX Runtime doing the heavy lifting and
 quantization keeping it fast and small.
 
-The natural next step is deciding *where* to run it. If you're heading for
-on-device inference, read [Edge ML Deployment](/blog/edge-ml-deployment). If
-you're standing up a serving API, [Production ML Workflows](/blog/production-workflows)
-covers the full path from prototype to scale.
+The natural next step is deciding *where* to run it. For the trade-offs between
+running on a server and on the device, read
+[Server-Side vs On-Device ML Inference](/blog/server-side-vs-on-device-inference).
+If you're standing up a serving API, [Production ML Workflows](/blog/production-workflows)
+covers a real, end-to-end production architecture.

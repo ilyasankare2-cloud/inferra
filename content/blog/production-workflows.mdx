@@ -1,0 +1,217 @@
+---
+title: "Production ML Workflows: How We Serve an ONNX Model with FastAPI"
+description: "A real, honest production architecture: an ONNX image classifier served by FastAPI on Railway, loaded from object storage at startup, with one shared inference session on CPU — and what we'd improve."
+date: "2026-05-25"
+tags: ["mlops", "production", "onnx", "fastapi", "inference"]
+---
+
+Most ML tutorials end where the hard part begins: the model works in a notebook,
+and then… what? This is a walkthrough of a real production deployment — the
+architecture behind **TrichAi**, an app that classifies flower images into four
+categories and returns a confidence-weighted quality estimate. No idealized
+diagram, no invented benchmarks. Just the architecture that's actually running,
+the decisions behind it, and the parts we'd still improve.
+
+## The architecture at a glance
+
+```
+  Web app  ─┐
+            ├─►  FastAPI on Railway  ─►  ONNX Runtime (CPU)  ─►  prediction
+  Mobile  ──┘          │
+                       └─ model.onnx pulled from Cloudflare R2 at startup
+```
+
+One backend serves both clients. The web frontend and the React Native mobile
+app send the exact same request to the same endpoint — there is no separate
+mobile inference path. Everything funnels through one FastAPI service.
+
+The core stack, verbatim from the repo:
+
+- **FastAPI 0.136** + uvicorn
+- **onnxruntime 1.24.4**, `CPUExecutionProvider` (no GPU)
+- Model: **EfficientNetV2-S**, fine-tuned, exported to ONNX, 4 classes
+- **Cloudflare R2** for model storage
+- Deployed on **Railway**
+
+## Decision 1: load the model from object storage at startup
+
+The `.onnx` file is **not** baked into the Docker image. On boot, the service
+downloads it from Cloudflare R2 and loads it into memory:
+
+```python
+import onnxruntime as ort
+
+# Downloaded from R2 on startup, then loaded once.
+self.session = ort.InferenceSession(
+    model_path,
+    providers=["CPUExecutionProvider"],
+)
+```
+
+Why decouple the model from the image?
+
+- **Smaller, faster image builds.** The container doesn't carry a large binary
+  artifact, so CI and deploys stay quick.
+- **Update the model without redeploying code.** Pushing a new `.onnx` to R2 and
+  restarting is enough — no rebuild.
+- **Separation of concerns.** Code lives in git; the model artifact lives in
+  object storage, versioned independently.
+
+The trade-off is **cold start**: the model must download before the service is
+ready. For an EfficientNetV2-S exported in float32 (no quantization), the file
+is on the order of ~80 MB — typical for this architecture — so the download adds
+a few seconds to boot. On a long-lived Railway service that restarts rarely,
+that's an acceptable price for the operational flexibility.
+
+## Decision 2: one shared inference session
+
+The `InferenceSession` is created **once at startup** and reused for every
+request — not created per request. This matters more than it looks:
+
+- Building a session parses the graph and allocates buffers. Doing that per
+  request would dominate latency.
+- ONNX Runtime's `Run()` is safe to call concurrently on a shared session, so a
+  single session handles parallel requests without a lock.
+
+This is the single most important serving optimization, and it's free: just
+don't reload the model on every call.
+
+## Decision 3: CPU, not GPU
+
+The model runs on `CPUExecutionProvider`. No GPU, no hardware acceleration. For
+a workload like this — single-image classification, modest request volume, a
+~80 MB model — CPU inference is genuinely the right call:
+
+- **No GPU tax.** GPU instances are far more expensive and would sit idle
+  between requests.
+- **Simpler ops.** No CUDA versions, no driver matrices, no GPU scheduling.
+- **Good enough.** EfficientNetV2-S on CPU classifies a single 224×224 image
+  fast enough for an interactive app.
+
+The honest caveat: the model is **float32 and unquantized**. Dynamic INT8
+quantization would shrink it roughly 4× and speed up CPU inference further. We
+haven't done it yet — it's the clearest available win (see *What we'd improve*).
+
+## The inference path
+
+Preprocessing matches the training pipeline exactly — get this wrong and
+accuracy quietly collapses:
+
+```python
+from PIL import Image
+
+img = img.resize((224, 224), Image.LANCZOS)
+# ImageNet normalization
+# mean = [0.485, 0.456, 0.406]
+# std  = [0.229, 0.224, 0.225]
+```
+
+Then run the session and post-process the logits into the response. The quality
+estimate is a simple, transparent linear interpolation on the model's
+confidence:
+
+```python
+thc_estimate = thc_min + (thc_max - thc_min) * confidence
+```
+
+No second model, no magic — just a documented formula over the classifier's
+output. Transparency here is a feature: anyone can see exactly how the number is
+derived.
+
+## The serving layer
+
+A single endpoint accepts an uploaded image as `multipart/form-data` and returns
+JSON. Input is constrained at the boundary — content types and a 10 MB size cap:
+
+```python
+from fastapi import FastAPI, UploadFile, File, HTTPException
+
+app = FastAPI()
+MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+
+@app.post("/analyze")
+async def analyze(file: UploadFile = File(...)):
+    if file.content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(415, "Unsupported image type")
+    data = await file.read()
+    if len(data) > MAX_BYTES:
+        raise HTTPException(413, "Image too large")
+    result = classifier.predict(data)
+    return {"success": True, "result": result}
+```
+
+The response is a flat, predictable shape:
+
+```json
+{
+  "success": true,
+  "result": {
+    "label": "bud",
+    "confidence": 0.9241,
+    "quality": "Alta",
+    "thc_estimate": 24,
+    "all_probs": { "bud": 0.92, "hash": 0.05, "other": 0.02, "plant": 0.01 }
+  }
+}
+```
+
+Validating at the boundary — type and size — keeps malformed input from ever
+reaching the model. That's the only place untrusted data enters the system, so
+it's the only place that needs defensive checks.
+
+## One API, two clients
+
+Because inference is server-side, the mobile app is thin. It captures a photo
+and posts it to the same `/analyze` endpoint as the web app:
+
+```tsx
+const form = new FormData();
+form.append("file", { uri: image.uri, type: "image/jpeg", name: "photo.jpg" });
+const res = await fetch(`${API}/analyze`, { method: "POST", body: form });
+```
+
+No ONNX Runtime Mobile, no TensorFlow Lite, no model shipped in the app bundle.
+The phone is a camera and a `fetch`. This keeps both clients trivial and means
+the model only has to be correct and deployed in one place.
+
+> If you're exporting a model to ONNX in the first place, the
+> [Getting Started with ONNX](/blog/getting-started-onnx) guide covers the
+> export and runtime basics this architecture is built on.
+
+## What we'd improve
+
+Honesty is part of the point here. This system works, but it has real gaps:
+
+- **No latency instrumentation.** Sentry runs with `tracesSampleRate: 0`, so we
+  have no measured p50/p99 inference times in production. We can reason about
+  latency, but we can't quote it — and you shouldn't trust anyone who quotes
+  numbers they didn't measure. Step one of improving performance is measuring
+  it.
+- **No quantization.** The float32 model is the low-hanging fruit: INT8 dynamic
+  quantization would cut size and CPU latency with minimal accuracy loss.
+- **Cold-start download.** Pulling ~80 MB from R2 on boot is fine for a service
+  that rarely restarts, but it would hurt in a scale-to-zero or rapidly-scaling
+  setup. Worth revisiting if traffic patterns change.
+
+None of these block the product. All of them are on the list — and naming them
+is more useful to you than pretending they don't exist.
+
+## Takeaways
+
+The patterns here transfer far beyond this one app:
+
+1. **Store the model artifact separately** from the code, and load it at
+   startup. Independent versioning, smaller images.
+2. **Create one inference session and share it.** The biggest, cheapest latency
+   win available.
+3. **Default to CPU** until a measurement tells you otherwise. GPUs are a cost
+   and an ops burden you should have to justify.
+4. **Validate at the boundary**, keep the response shape flat and predictable,
+   and serve every client from one API.
+5. **Measure before you optimize.** We can't, yet — so that's the first thing on
+   the list.
+
+Deciding whether to serve on a server like this or push inference onto the
+device is its own question with real trade-offs. That's the subject of
+[Server-Side vs On-Device ML Inference](/blog/server-side-vs-on-device-inference)
+— including why this architecture deliberately chose the server.
