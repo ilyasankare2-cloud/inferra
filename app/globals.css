@@ -521,6 +521,25 @@ a:hover {
   font-size: 0.8rem;
 }
 
+/* ---------- 404 ---------- */
+.notfound {
+  text-align: center;
+  padding: 4rem 0 2rem;
+}
+
+.notfound-code {
+  font-size: 4rem;
+  font-weight: 800;
+  color: var(--accent);
+  margin: 0;
+  line-height: 1;
+  letter-spacing: -0.03em;
+}
+
+.notfound h1 {
+  margin: 0.5rem 0 0.75rem;
+}
+
 /* ---------- Responsive: two-column article on desktop ---------- */
 @media (min-width: 1000px) {
   .container {
