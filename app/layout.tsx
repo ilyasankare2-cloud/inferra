@@ -1,7 +1,12 @@
 import type { Metadata } from "next";
 import Link from "next/link";
 import { site } from "@/lib/site";
+import { Footer } from "@/components/Footer";
+import { Analytics } from "@/components/Analytics";
+import { AdSenseLoader } from "@/components/AdSense";
+import { JsonLd } from "@/components/JsonLd";
 import "./globals.css";
+import "highlight.js/styles/github-dark.css";
 
 export const metadata: Metadata = {
   metadataBase: new URL(site.url),
@@ -27,6 +32,14 @@ export const metadata: Metadata = {
     : {}),
 };
 
+const organizationLd = {
+  "@context": "https://schema.org",
+  "@type": "Organization",
+  name: site.name,
+  url: site.url,
+  description: site.description,
+};
+
 export default function RootLayout({
   children,
 }: {
@@ -35,15 +48,25 @@ export default function RootLayout({
   return (
     <html lang="en">
       <body>
+        <JsonLd data={organizationLd} />
         <header className="site-header">
           <div className="inner">
             <Link href="/" className="brand">
               {site.name}
             </Link>
-            <span className="muted">AI · automation · tooling</span>
+            <nav className="site-nav" aria-label="Main">
+              {site.navLinks.map((link) => (
+                <Link key={link.href} href={link.href}>
+                  {link.label}
+                </Link>
+              ))}
+            </nav>
           </div>
         </header>
         <main className="container">{children}</main>
+        <Footer />
+        <Analytics />
+        <AdSenseLoader />
       </body>
     </html>
   );
