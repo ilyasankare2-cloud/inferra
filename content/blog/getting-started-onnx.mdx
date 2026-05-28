@@ -1,0 +1,231 @@
+---
+title: "Getting Started with ONNX: Train and Deploy Custom Models"
+description: "A practical, end-to-end guide to ONNX: what it is, how to export models from PyTorch and TensorFlow, run fast inference with ONNX Runtime, and ship to production."
+date: "2026-05-28"
+tags: ["onnx", "machine-learning", "deployment", "inference"]
+---
+
+If you have ever trained a model in PyTorch, handed it to a teammate who works
+in a different stack, and watched everything grind to a halt over dependency
+mismatches, ONNX is the format that makes that problem disappear. It lets you
+train in one framework and run anywhere — a server, a phone, a browser, or an
+embedded board — without rewriting the model.
+
+This guide walks through the full path: what ONNX actually is, how to export a
+model, how to run inference with ONNX Runtime, how to make it fast, and how to
+deploy it. Every code sample is real and runnable.
+
+## What ONNX is (and what it isn't)
+
+ONNX — Open Neural Network Exchange — is an **open format for representing
+machine learning models**. A `.onnx` file is a serialized computation graph:
+nodes are operators (Conv, MatMul, Relu, Softmax…), edges are tensors, and the
+whole thing is described in a framework-neutral way.
+
+Two ideas matter:
+
+- **Operators and opsets.** ONNX defines a standard set of operators. Each
+  release bundles them into an *opset version*. When you export, you target an
+  opset (e.g. opset 17); the runtime you deploy to must support at least that
+  opset.
+- **It's an interchange format, not a training framework.** You train in
+  PyTorch, TensorFlow, scikit-learn, or wherever. ONNX is the portable artifact
+  you produce *after* training, optimized for inference.
+
+The payoff: decouple *training* from *serving*. Your data scientists keep their
+PyTorch workflow; your production runtime never needs PyTorch installed.
+
+## The workflow at a glance
+
+1. Train a model in your framework of choice.
+2. Export it to `.onnx`.
+3. Validate the exported graph.
+4. Run inference with ONNX Runtime.
+5. Optimize (quantize, fuse, pick an execution provider).
+6. Deploy.
+
+We'll do each step.
+
+## Step 1 — Train (or bring) a model
+
+We'll use a tiny PyTorch image classifier so the export step is the focus, not
+the training. Any `nn.Module` works the same way.
+
+```python
+import torch
+import torch.nn as nn
+
+class TinyClassifier(nn.Module):
+    def __init__(self, num_classes: int = 10):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 16, 3, padding=1), nn.ReLU(),
+            nn.MaxPool2d(2),
+            nn.Conv2d(16, 32, 3, padding=1), nn.ReLU(),
+            nn.AdaptiveAvgPool2d(1),
+        )
+        self.head = nn.Linear(32, num_classes)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        return self.head(x)
+
+model = TinyClassifier(num_classes=10)
+# ... your normal training loop here ...
+model.eval()  # always export in eval mode
+```
+
+The single most common export bug is forgetting `model.eval()`. Dropout and
+batch-norm layers behave differently in training mode, and you do not want that
+baked into your inference graph.
+
+## Step 2 — Export to ONNX
+
+### From PyTorch
+
+```python
+import torch
+
+dummy_input = torch.randn(1, 3, 224, 224)
+
+torch.onnx.export(
+    model,
+    dummy_input,
+    "tiny_classifier.onnx",
+    input_names=["input"],
+    output_names=["logits"],
+    opset_version=17,
+    dynamic_axes={
+        "input": {0: "batch"},
+        "logits": {0: "batch"},
+    },
+)
+```
+
+The key argument is `dynamic_axes`. Without it, the graph is frozen to a batch
+size of 1, and you'll get a shape error the first time you send two images at
+once. Marking axis 0 as `"batch"` lets the same model accept any batch size at
+runtime.
+
+### From TensorFlow / Keras
+
+TensorFlow doesn't export ONNX natively; use the `tf2onnx` converter:
+
+```bash
+pip install tf2onnx
+python -m tf2onnx.convert \
+  --saved-model ./saved_model_dir \
+  --output tiny_classifier.onnx \
+  --opset 17
+```
+
+## Step 3 — Validate the graph
+
+Before trusting the file, check it's structurally valid:
+
+```python
+import onnx
+
+onnx_model = onnx.load("tiny_classifier.onnx")
+onnx.checker.check_model(onnx_model)
+print("Model is valid. Opset:", onnx_model.opset_import[0].version)
+```
+
+For a visual sanity check, open the file in [Netron](https://netron.app) — it
+renders the full graph and is invaluable when an export goes sideways.
+
+## Step 4 — Run inference with ONNX Runtime
+
+ONNX Runtime (ORT) is the high-performance engine that executes `.onnx` files.
+It has no dependency on PyTorch or TensorFlow.
+
+```python
+import numpy as np
+import onnxruntime as ort
+
+session = ort.InferenceSession(
+    "tiny_classifier.onnx",
+    providers=["CPUExecutionProvider"],
+)
+
+x = np.random.randn(1, 3, 224, 224).astype(np.float32)
+logits = session.run(["logits"], {"input": x})[0]
+
+probs = np.exp(logits) / np.exp(logits).sum(axis=1, keepdims=True)
+print("Predicted class:", int(probs.argmax(axis=1)[0]))
+```
+
+Two things trip people up here:
+
+- **dtype must match.** ORT is strict: if the graph expects `float32`, passing
+  `float64` raises an error. Cast explicitly with `.astype(np.float32)`.
+- **Input names must match export.** We named the input `"input"` during
+  export, so the feed dict key is `"input"`.
+
+## Step 5 — Make it fast
+
+This is where ONNX earns its keep in production.
+
+**Execution providers.** ORT can dispatch to different backends. On a GPU box:
+
+```python
+session = ort.InferenceSession(
+    "tiny_classifier.onnx",
+    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+```
+
+The list is a priority order — ORT uses CUDA where it can and falls back to CPU
+for any unsupported node. Other providers include TensorRT, OpenVINO, and
+CoreML, depending on your target hardware.
+
+**Quantization.** Dynamic quantization shrinks the model and speeds up CPU
+inference, often with negligible accuracy loss:
+
+```python
+from onnxruntime.quantization import quantize_dynamic, QuantType
+
+quantize_dynamic(
+    "tiny_classifier.onnx",
+    "tiny_classifier.int8.onnx",
+    weight_type=QuantType.QInt8,
+)
+```
+
+An INT8 model is roughly 4× smaller than its FP32 source — which matters a lot
+when you deploy to constrained devices.
+
+## Step 6 — Deploy
+
+Where you run the `.onnx` file is the whole point of the format:
+
+- **Server / API.** Wrap the ORT session in a web service and serve predictions
+  over HTTP. This is the most common production pattern, and the subject of a
+  dedicated walkthrough in [Production ML Workflows](/blog/production-workflows).
+- **Edge and mobile.** ORT Mobile and ONNX Runtime Web let the same model run
+  on-device — no network round trip, better privacy, lower latency. See
+  [Edge ML Deployment](/blog/edge-ml-deployment) for the device-side details.
+- **Browser.** `onnxruntime-web` runs models client-side via WebAssembly or
+  WebGPU.
+
+## Common pitfalls
+
+- **Forgetting `model.eval()`** bakes training-mode behavior into the graph.
+- **Skipping `dynamic_axes`** locks you to a single batch size.
+- **Opset mismatch** — exporting at opset 17 but deploying to a runtime that
+  only supports 13 will fail at load time. Check both ends.
+- **Unsupported custom ops.** Exotic layers may not have an ONNX operator. Catch
+  this early by validating the export, not in production.
+
+## Conclusion
+
+ONNX turns "it works on my machine" into "it works everywhere." Train in the
+framework your team prefers, export once, and run that same artifact on a
+server, a phone, or in a browser — with ONNX Runtime doing the heavy lifting and
+quantization keeping it fast and small.
+
+The natural next step is deciding *where* to run it. If you're heading for
+on-device inference, read [Edge ML Deployment](/blog/edge-ml-deployment). If
+you're standing up a serving API, [Production ML Workflows](/blog/production-workflows)
+covers the full path from prototype to scale.
