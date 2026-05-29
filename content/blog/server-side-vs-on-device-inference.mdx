@@ -77,7 +77,7 @@ dyno.
 
 You'd choose on-device inference if any of these are true:
 
-**1. Latency is the constraint.** AR filters need <100ms round-trip. Real-time
+**1. Latency is the constraint.** AR filters need `< 100ms` round-trip. Real-time
 speech recognition can't wait for a network call. Augmented reality needs
 response time measured in milliseconds. These use cases require on-device.
 
@@ -115,10 +115,10 @@ Run through this checklist:
 
 | Question | Leans toward... |
 |----------|---|
-| Must latency be <100ms? | On-device |
+| Must latency be `< 100ms`? | On-device |
 | Must it work offline? | On-device |
 | Is privacy a hard requirement? | On-device |
-| Is the model >20 MB? | Server-side |
+| Is the model `> 20 MB`? | Server-side |
 | Do you need frequent updates? | Server-side |
 | Do you have modest request volume? | Server-side (cost) |
 | Are you in early development? | Server-side (speed) |
