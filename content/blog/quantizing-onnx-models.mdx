@@ -1,0 +1,154 @@
+---
+title: "Quantizing ONNX Models: When It's Actually Worth It"
+description: "A practical guide to INT8 and FP16 quantization for ONNX models — how much you save, what you risk, and a real decision: should an unquantized production model be quantized?"
+date: "2026-05-23"
+tags: ["onnx", "quantization", "inference", "optimization"]
+---
+
+Quantization is the most over-recommended and under-analyzed optimization in ML
+deployment. "Just quantize it" gets repeated like it's free. It isn't — it's a
+trade between size, speed, and accuracy, and whether that trade is worth it
+depends entirely on your situation.
+
+This guide explains what quantization actually does, the real numbers, and walks
+through a concrete decision: a production model running unquantized in float32,
+and whether it should change.
+
+## What quantization actually does
+
+A trained model stores its weights as 32-bit floating point numbers (FP32).
+Quantization converts those to lower-precision formats:
+
+- **FP16** (half precision): 16-bit floats. ~2× smaller, minimal accuracy loss,
+  great on GPUs that have FP16 hardware.
+- **INT8**: 8-bit integers. ~4× smaller, meaningful CPU speedups, but requires
+  care to preserve accuracy.
+
+The intuition: most neural networks are over-precise. The difference between a
+weight of `0.4831092` and `0.48` rarely changes the prediction. Quantization
+exploits that slack.
+
+## The two kinds of INT8 quantization
+
+This distinction trips people up constantly.
+
+### Dynamic quantization
+
+Weights are quantized ahead of time; activations are quantized on the fly during
+inference. No calibration data needed. It's the easy button:
+
+```python
+from onnxruntime.quantization import quantize_dynamic, QuantType
+
+quantize_dynamic(
+    "model.onnx",
+    "model.int8.onnx",
+    weight_type=QuantType.QInt8,
+)
+```
+
+Best for: transformer and RNN-heavy models, and anywhere you want the win
+without a calibration dataset.
+
+### Static quantization
+
+Both weights and activations are quantized ahead of time, using a representative
+**calibration dataset** to determine the activation ranges:
+
+```python
+from onnxruntime.quantization import quantize_static, CalibrationDataReader
+
+class ImageCalibrationReader(CalibrationDataReader):
+    def __init__(self, samples):
+        self.iter = iter([{"input": s} for s in samples])
+
+    def get_next(self):
+        return next(self.iter, None)
+
+quantize_static(
+    "model.onnx",
+    "model.int8.onnx",
+    ImageCalibrationReader(calibration_samples),
+)
+```
+
+Best for: CNNs and vision models, where static quantization typically preserves
+accuracy better than dynamic and gives bigger speedups — at the cost of needing
+calibration data.
+
+## The real numbers
+
+Honest ranges, not marketing:
+
+| Format | Size vs FP32 | Accuracy impact | Where it helps |
+|--------|--------------|-----------------|----------------|
+| FP16 | ~50% | Negligible | GPU inference |
+| INT8 dynamic | ~25% | Small (0-2% typical) | CPU, transformers |
+| INT8 static | ~25% | Small with good calibration | CPU, CNNs |
+
+The accuracy impact is **model-dependent**. A robust model barely notices INT8;
+a delicately-balanced one can lose several points. You don't know until you
+measure on *your* validation set — which is the whole point of the next section.
+
+## A real decision: should this model be quantized?
+
+Consider a concrete production case — a fine-tuned **EfficientNetV2-S** image
+classifier, exported to ONNX, running in **float32**, served on CPU
+(`CPUExecutionProvider`), no GPU. The model is roughly 80 MB. It's deployed and
+working, but it has never been quantized. Should it be?
+
+Walk the actual trade-offs:
+
+**The case for INT8 static quantization here:**
+
+- It's a CNN on CPU — exactly where INT8 static shines. The ~4× size reduction
+  would take the model from ~80 MB to ~20 MB.
+- Smaller model means **faster cold start**: if you load the model from object
+  storage at boot (a common pattern), pulling 20 MB instead of 80 MB shaves
+  real seconds off startup.
+- INT8 CPU inference is typically faster, lowering per-request latency.
+
+**The case against (or "not yet"):**
+
+- **No measured baseline.** If you don't currently instrument inference latency,
+  you can't prove the speedup — or notice an accuracy regression. Optimizing
+  before measuring is guessing.
+- **Calibration data needed.** Static quantization needs a representative sample
+  of real inputs. Assembling that is real work.
+- **It's working.** If the current latency is acceptable to users, quantization
+  is an optimization, not a fix. Optimizations compete for time against features.
+
+**The honest verdict:** quantization is the clear *eventual* win for this model
+— CNN, CPU, large float32 file is the textbook INT8-static case. But the correct
+first step isn't `quantize_static()`. It's **instrumenting latency** so the
+before/after is measurable, then quantizing with a calibration set and comparing
+accuracy on a held-out validation set. Quantize second, measure first.
+
+## How to quantize responsibly
+
+1. **Measure the baseline.** Latency (p50/p99) and accuracy on your validation
+   set, before touching anything.
+2. **Pick the method.** Dynamic for transformers/RNNs; static for CNNs/vision.
+3. **Quantize and re-measure.** Same validation set, same latency harness.
+4. **Decide on the evidence.** If accuracy holds and latency/size improve, ship
+   it. If accuracy drops past your threshold, try FP16, or quantize selectively.
+
+## Common mistakes
+
+- **Quantizing without an accuracy gate.** You might ship a measurably worse
+  model and never know.
+- **Using dynamic quantization on a CNN** and concluding "quantization doesn't
+  help" — you used the wrong method.
+- **Optimizing prematurely.** If you haven't measured latency, you're not ready
+  to quantize.
+
+## Conclusion
+
+Quantization is a powerful tool, not a reflex. FP16 is nearly free on GPUs; INT8
+gives real CPU and size wins but demands measurement. For a large float32 CNN on
+CPU, it's almost certainly worth it — but only after you've instrumented latency
+and can prove the trade on your own data.
+
+For the export step that produces the model you'd quantize, see
+[Getting Started with ONNX](/blog/getting-started-onnx). For where this fits in a
+real serving stack, see [Production ML Workflows](/blog/production-workflows).

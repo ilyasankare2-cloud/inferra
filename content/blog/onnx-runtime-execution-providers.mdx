@@ -1,0 +1,140 @@
+---
+title: "Choosing an ONNX Runtime Execution Provider: CPU, CUDA, TensorRT, CoreML"
+description: "ONNX Runtime can dispatch the same model to very different hardware backends. A practical guide to execution providers — what each is for, how the fallback chain works, and how to choose."
+date: "2026-05-21"
+tags: ["onnx", "inference", "optimization", "deployment"]
+---
+
+One of the most useful and least understood features of ONNX Runtime is the
+**execution provider** (EP) system. The same `.onnx` file can run on a CPU, an
+NVIDIA GPU, a Mac's Neural Engine, or a mobile NPU — and you select which by
+passing a list of providers. Get this right and you can cut latency by an order
+of magnitude. Get it wrong and you silently run on the slowest backend while
+paying for the fastest hardware.
+
+## What an execution provider is
+
+An execution provider is a backend that actually executes the operators in your
+model graph. ONNX Runtime is the orchestrator; the EP is the engine. When you
+create a session, you give ORT a *priority-ordered list* of providers:
+
+```python
+import onnxruntime as ort
+
+session = ort.InferenceSession(
+    "model.onnx",
+    providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+)
+```
+
+ORT assigns each node in the graph to the highest-priority provider that
+supports it. Nodes a provider can't handle fall back to the next provider in the
+list. This is the key mental model: **it's a fallback chain, not a single
+choice.**
+
+## The major providers
+
+### CPUExecutionProvider
+
+The default, always available, runs everywhere. It's the floor you can always
+fall back to.
+
+- **Use when:** modest throughput, no GPU, simplicity matters, or your model is
+  small. A surprising amount of production inference runs perfectly well on CPU.
+- **Reality check:** for many real services — single-image classification at
+  human interaction speeds — CPU is not a compromise, it's the correct,
+  cheapest choice.
+
+### CUDAExecutionProvider
+
+Runs on NVIDIA GPUs via CUDA.
+
+- **Use when:** high throughput, large models, or batch inference. The win grows
+  with model size and batch size.
+- **Watch out for:** CUDA/cuDNN version compatibility — this is the classic
+  source of "works on my machine" GPU pain. The ORT build, CUDA version, and
+  driver must align.
+
+### TensorRTExecutionProvider
+
+Also NVIDIA, but goes further: TensorRT compiles and heavily optimizes the graph
+for the specific GPU (layer fusion, precision calibration, kernel autotuning).
+
+- **Use when:** you need the absolute lowest GPU latency and can afford a slow
+  first run (the engine build) and more setup complexity.
+- **Watch out for:** the optimization/build step can take minutes and is often
+  cached per-model-per-GPU. Great for stable production, awkward for rapid
+  iteration.
+
+### CoreMLExecutionProvider / NNAPI
+
+On-device acceleration: CoreML on Apple devices (tapping the Neural Engine),
+NNAPI on Android.
+
+- **Use when:** running on-device and you want hardware acceleration without
+  shipping a CUDA stack.
+- **Watch out for:** not every operator is supported; unsupported nodes fall
+  back to CPU, which can fragment the graph and erode the speedup.
+
+### OpenVINOExecutionProvider
+
+Intel's toolkit for accelerating on Intel CPUs, integrated GPUs, and VPUs.
+
+- **Use when:** deploying on Intel edge hardware or Intel-heavy server fleets.
+
+## How the fallback chain actually behaves
+
+This is where people get surprised. Suppose you request:
+
+```python
+providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+```
+
+If the CUDA provider isn't available (wrong build, missing driver), ORT does
+**not** error — it silently runs everything on CPU. Your "GPU service" is a CPU
+service and the only symptom is that it's slow. Always verify what actually got
+assigned:
+
+```python
+print(session.get_providers())
+# -> ['CPUExecutionProvider']  means CUDA did NOT load
+```
+
+If you expected CUDA and see only CPU, your GPU setup is broken. Make this check
+part of your startup health check so a misconfiguration fails loudly instead of
+quietly costing you 10× latency.
+
+## A decision guide
+
+| Situation | Provider |
+|-----------|----------|
+| No GPU, modest volume | CPU |
+| NVIDIA GPU, want easy wins | CUDA |
+| NVIDIA GPU, need minimum latency | TensorRT |
+| Apple device, on-device | CoreML |
+| Android device, on-device | NNAPI |
+| Intel edge hardware | OpenVINO |
+
+And the meta-advice: **start with CPU, measure, and only move to a GPU provider
+when the numbers justify the cost and complexity.** A GPU you don't need is just
+an expensive way to run a model that CPU handled fine.
+
+## Verifying and tuning
+
+- **Confirm the assignment** with `session.get_providers()` at startup.
+- **Set provider options** where they matter — e.g. device ID for multi-GPU, or
+  workspace size for TensorRT — via the options argument to `InferenceSession`.
+- **Benchmark the same model** across providers on your real inputs. Theoretical
+  speedups don't always survive contact with your specific graph.
+
+## Conclusion
+
+The execution provider system is what makes "train once, run anywhere" real. The
+practical rules: it's a fallback chain, so order matters; a missing GPU provider
+fails silently to CPU, so always verify what loaded; and CPU is the right default
+until measurement says otherwise.
+
+For the export workflow that produces these models, see
+[Getting Started with ONNX](/blog/getting-started-onnx). For shrinking the model
+so any provider runs it faster, see
+[Quantizing ONNX Models](/blog/quantizing-onnx-models).

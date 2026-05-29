@@ -1,0 +1,133 @@
+---
+title: "The Silent Accuracy Killer: Preprocessing Mismatch"
+description: "Your model scores 94% in the notebook and falls apart in production. The cause is usually not the model — it's a preprocessing mismatch between training and inference. Here's how to find and prevent it."
+date: "2026-05-22"
+tags: ["inference", "debugging", "machine-learning", "production"]
+---
+
+Here's a bug that has cost more engineer-hours than almost any other in applied
+ML: the model that works perfectly in training and mysteriously underperforms in
+production. The accuracy was 94% on the validation set. In production it feels
+more like a coin flip. The model didn't change. The weights are identical.
+
+The culprit is almost always **preprocessing mismatch** — the input pipeline at
+inference time doesn't exactly match the one used during training. The model
+never sees the data it was trained to expect, so it quietly produces garbage.
+
+## Why this is so insidious
+
+It doesn't crash. It doesn't throw. It doesn't even look wrong — the model still
+returns confident-looking predictions. They're just *wrong* in a way that's hard
+to attribute, because every individual component appears to work.
+
+And it's hard to catch because training and inference usually live in **separate
+codebases**. Training is a Python notebook with torchvision transforms.
+Inference is a production service, maybe in a different language, with hand-rolled
+preprocessing. Two pipelines, written months apart, that must produce
+bit-for-bit compatible tensors. They drift.
+
+## The usual suspects
+
+### 1. Normalization values
+
+This is the number-one offender. Models trained on ImageNet-derived backbones
+expect inputs normalized with specific per-channel statistics:
+
+```python
+mean = [0.485, 0.456, 0.406]
+std  = [0.229, 0.224, 0.225]
+```
+
+If training normalized with these values and your inference code skips
+normalization — or uses a simple `/255.0` — every pixel is in the wrong range.
+The model sees inputs it was never trained on. Accuracy collapses.
+
+### 2. Resize method and dimensions
+
+A model trained on 224×224 inputs needs 224×224 inputs. Obvious. Less obvious:
+the **resize algorithm** matters too. Bilinear, bicubic, and Lanczos produce
+subtly different pixels:
+
+```python
+from PIL import Image
+img = img.resize((224, 224), Image.LANCZOS)
+```
+
+If training used one interpolation and inference uses another, you've introduced
+a distribution shift. It's small per-pixel, but it adds up — especially for
+fine-grained classification.
+
+### 3. Channel order: RGB vs BGR
+
+OpenCV loads images as **BGR**. PIL and most training pipelines use **RGB**. If
+you train with PIL (RGB) and serve with OpenCV (BGR) without converting, your
+red and blue channels are swapped. The model sees a blue-tinted world.
+
+```python
+# OpenCV loads BGR — convert before feeding an RGB-trained model
+img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+```
+
+### 4. Value range and dtype
+
+Is the input `[0, 1]` floats or `[0, 255]` integers? Float32 or float64? A model
+expecting normalized float32 in `[0, 1]` will misbehave on raw `[0, 255]`
+values. ONNX Runtime is strict about dtype and will often error — but a range
+mismatch fails *silently*.
+
+### 5. Channel layout: NCHW vs NHWC
+
+PyTorch uses NCHW (batch, channels, height, width). TensorFlow often uses NHWC.
+Feed a tensor in the wrong layout and either it errors on shape, or worse,
+it "works" with a transposed interpretation and produces nonsense.
+
+## How to catch it
+
+### Golden-sample testing
+
+The single most effective technique: pick a known input, run it through your
+*training* preprocessing, and save the resulting tensor. Then run the same raw
+input through your *production* preprocessing and assert the tensors match:
+
+```python
+import numpy as np
+
+expected = np.load("golden_tensor.npy")     # from training pipeline
+actual = production_preprocess("test.jpg")   # from serving pipeline
+
+np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-3)
+```
+
+If this assertion fails, you've found your bug before it ever reaches a user.
+Make it a unit test in the serving repo.
+
+### Compare a prediction end-to-end
+
+Run the same image through both the training environment and production. The
+output probabilities should match to several decimal places. If they diverge,
+the preprocessing diverged.
+
+## How to prevent it
+
+- **Share the preprocessing code.** If training and serving can import the same
+  preprocessing function, they can't drift. This is the cleanest fix.
+- **Document the contract.** If they can't share code, write down the exact
+  spec: dimensions, resize method, normalization constants, channel order,
+  dtype, layout. Treat it as an API contract.
+- **Bake preprocessing into the model.** Some teams add resize/normalize as ONNX
+  graph operators so the model accepts raw images. The preprocessing then can't
+  drift because it's *inside* the artifact.
+- **Test at the boundary.** Golden-sample tests in CI catch drift the moment
+  someone edits the serving pipeline.
+
+## Conclusion
+
+When a deployed model underperforms its validation score, suspect the
+preprocessing before the model. Check normalization constants, resize method,
+channel order, value range, and tensor layout — in that order. The fix is rarely
+retraining; it's making the inference pipeline match the training pipeline
+exactly, and adding a golden-sample test so it stays that way.
+
+For the broader serving architecture where this pipeline lives, see
+[Production ML Workflows](/blog/production-workflows). For the export step, see
+[Getting Started with ONNX](/blog/getting-started-onnx).

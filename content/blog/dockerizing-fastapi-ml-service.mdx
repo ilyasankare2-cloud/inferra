@@ -1,0 +1,162 @@
+---
+title: "Containerizing a FastAPI ML Service for Production"
+description: "A practical guide to Dockerizing a FastAPI inference service: a lean multi-stage build, why you shouldn't bake the model into the image, sane defaults for uvicorn, and the mistakes that bloat images."
+date: "2026-05-20"
+tags: ["fastapi", "docker", "mlops", "production", "deployment"]
+---
+
+You have a FastAPI service that wraps an ONNX model. It runs on your laptop. Now
+it needs to run identically on a deploy platform — Railway, Fly, a Kubernetes
+cluster, wherever. That's what a container gives you: the same environment
+everywhere. This guide covers a production-grade Dockerfile for an ML inference
+service, and the decisions that keep it lean and fast.
+
+## Start with the right base image
+
+The base image choice drives your final size and your headaches. For Python ML
+services:
+
+- **`python:3.12-slim`** — the sweet spot. Small, Debian-based, has what most
+  Python wheels need. Start here.
+- **`python:3.12`** (full) — hundreds of MB of build tools you don't need at
+  runtime. Avoid for the final image.
+- **`alpine`** — tempting for size, but musl libc breaks many ML wheels
+  (NumPy, onnxruntime) or forces slow source builds. Usually not worth the pain.
+
+## A multi-stage build
+
+The key technique for a lean image: build dependencies in one stage, copy only
+what you need into a clean final stage. Build tools never reach production.
+
+```dockerfile
+# ---------- build stage ----------
+FROM python:3.12-slim AS builder
+
+WORKDIR /app
+ENV PIP_NO_CACHE_DIR=1
+
+COPY requirements.txt .
+RUN pip install --prefix=/install -r requirements.txt
+
+# ---------- runtime stage ----------
+FROM python:3.12-slim
+
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+
+# Copy only the installed packages from the build stage
+COPY --from=builder /install /usr/local
+COPY . .
+
+# Run as a non-root user
+RUN useradd --create-home appuser
+USER appuser
+
+EXPOSE 8000
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+A few decisions baked in here worth calling out.
+
+### Don't bake the model into the image
+
+It's tempting to `COPY model.onnx .` and ship it. Resist. A large model artifact
+in the image means:
+
+- Slower image builds and pushes on every code change.
+- A rebuild required just to update the model.
+- Bloated images in your registry.
+
+Instead, **load the model from object storage at startup** (S3, Cloudflare R2,
+GCS). The image stays small and the model versions independently. The trade-off
+is a cold-start download, which is fine for long-lived services. This is exactly
+the pattern covered in [Production ML Workflows](/blog/production-workflows).
+
+### Run as non-root
+
+The `useradd` + `USER appuser` lines aren't optional polish — running containers
+as root is a real security risk. If the process is compromised, root in the
+container is a far worse starting point for an attacker. Drop privileges.
+
+### Set the Python environment variables
+
+- `PYTHONUNBUFFERED=1` — logs stream immediately instead of being buffered, so
+  you actually see output in your platform's logs.
+- `PYTHONDONTWRITEBYTECODE=1` — skip `.pyc` files you don't need in a container.
+
+## A .dockerignore is not optional
+
+Without one, `COPY . .` drags your entire working directory into the image —
+`.git`, virtualenvs, caches, local model files, secrets. Always include:
+
+```
+.git
+.venv
+__pycache__
+*.pyc
+.env
+.env.local
+*.onnx
+.pytest_cache
+```
+
+Note `*.onnx` here — combined with loading the model from storage, this keeps
+local model files out of the image entirely. And `.env*` keeps secrets from
+leaking into a layer.
+
+## uvicorn workers and concurrency
+
+For CPU-bound inference, more workers is not automatically better. Each uvicorn
+worker is a separate process with its own copy of the model in memory. Four
+workers means four copies of an 80 MB model — 320 MB of RAM just for weights.
+
+Start with a single worker and a shared in-memory inference session (ONNX
+Runtime's `Run()` is safe to call concurrently). Scale horizontally — more
+container instances — rather than piling workers into one container, so your
+platform's autoscaler and load balancer do the work:
+
+```dockerfile
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+```
+
+Measure before adding workers. The right number depends on your CPU allocation
+and whether your inference releases the GIL (onnxruntime largely does).
+
+## Add a health check
+
+Your platform needs to know when the service is actually ready — which, for an
+ML service, means *after the model has loaded*, not just when the process
+starts:
+
+```python
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_loaded": classifier.is_ready()}
+```
+
+Point your platform's readiness probe at this. Otherwise traffic arrives before
+the model finishes downloading, and the first requests fail.
+
+## Keeping the image small — a checklist
+
+- Multi-stage build (build tools excluded from runtime) ✓
+- `slim` base image ✓
+- `.dockerignore` excluding git, caches, models, secrets ✓
+- `PIP_NO_CACHE_DIR=1` so pip's cache doesn't bloat a layer ✓
+- Model loaded from storage, not copied in ✓
+- CPU-only onnxruntime if you don't need GPU (the GPU package is much larger) ✓
+
+That last point matters: install `onnxruntime`, not `onnxruntime-gpu`, unless you
+actually serve on a GPU. The GPU package pulls in CUDA libraries that add
+hundreds of MB.
+
+## Conclusion
+
+A good ML container is lean and boring: a slim multi-stage build, the model
+loaded from storage rather than baked in, a non-root user, a real health check,
+and a single worker scaled horizontally. Get those right and the same image runs
+identically on your laptop and in production — which is the entire point.
+
+For the serving architecture this container runs, see
+[Production ML Workflows](/blog/production-workflows). For shrinking the model it
+loads, see [Quantizing ONNX Models](/blog/quantizing-onnx-models).
