@@ -1,0 +1,154 @@
+---
+title: "Server-Side vs On-Device ML Inference: How to Choose"
+description: "The core trade-off in ML deployment: run inference on a central server or push it to the device. Real case: why TrichAi chose the server, what it cost, and when you'd choose differently."
+date: "2026-05-24"
+tags: ["inference", "deployment", "mlops", "machine-learning"]
+---
+
+The moment your model works, you face a fork: does inference run on a server
+you control, or does it run on the user's device?
+
+This isn't a choice between "good" and "bad." It's a choice between different
+constraints. This guide uses a real case — TrichAi, an image classifier that
+chose the server — to walk through the trade-offs and the reasoning.
+
+## The choice, in concrete terms
+
+**Server-side inference:** User sends image → server runs model → server returns
+prediction. One model, one machine, one update path.
+
+**On-device inference:** User's phone/browser runs the model directly. No server
+needed. Model lives in the app bundle or is downloaded once and cached.
+
+Both work. They're just solving different problems.
+
+## Server-side: the TrichAi case
+
+TrichAi classifies flower images (bud, hash, other, plant) and estimates THC
+content. Here's why the team chose the server.
+
+### What they had
+
+The model was **EfficientNetV2-S**, exported to ONNX, running in float32 (no
+quantization). That's a ~80 MB artifact. The classification is secondary to the
+quality assessment — the real work is inference consistency, not latency. One
+request every few seconds, peak traffic easily handled by a single Railway
+dyno.
+
+### Why the server made sense
+
+1. **Model size.** 80 MB unquantized is large for a phone app bundle (many iOS
+   budgets are 100-150 MB total). Quantization would shrink it, but then the
+   team would maintain two model variants — more complexity.
+
+2. **One update path.** When you train a new version, you deploy it to one
+   place: the server. Web and mobile apps get the new model instantly on the
+   next request, with no app store updates, no version fragmentation. TrichAi
+   needed fast iteration during early development.
+
+3. **Shared session in memory.** A single `onnxruntime.InferenceSession` serves
+   all users. Creating a session is expensive (it parses the graph, allocates
+   buffers). On-device, users would either burn battery parsing on every boot
+   or keep the session alive — both friction.
+
+4. **Operational simplicity.** One model, one server, one inference runtime.
+   No ONNX Runtime Mobile drama, no WebAssembly loader, no device-specific
+   fallbacks. Just FastAPI on Railway.
+
+5. **Same API for both clients.** The web app and React Native mobile app send
+   identical requests to `/analyze`. No branching logic, no "what kind of
+   device is this?" — it's one code path.
+
+### What it cost
+
+- **Network round trip.** Every inference adds 50-200ms of latency, depending on
+  geography. For TrichAi, that's fine — a user takes a photo, waits a moment,
+  sees the result. For real-time, low-latency use cases (e.g. augmented reality,
+  instant feedback), it's a deal-breaker.
+- **Server cost.** CPU instances aren't free. That said, Railway's pricing is
+  low-friction, and a single dyno handles hundreds of requests.
+- **Privacy / data.** Images are sent to a server. TrichAi is transparent about
+  this (the privacy policy says images are uploaded for analysis), but it's a
+  constraint. On-device inference solves this for free.
+- **No offline.** If the server is down or the network is unavailable, the app
+  doesn't work. On-device inference works offline by definition.
+
+## On-device: when and why
+
+You'd choose on-device inference if any of these are true:
+
+**1. Latency is the constraint.** AR filters need <100ms round-trip. Real-time
+speech recognition can't wait for a network call. Augmented reality needs
+response time measured in milliseconds. These use cases require on-device.
+
+**2. Privacy is non-negotiable.** A health app that analyzes medical images
+shouldn't send images to a server, even temporarily. Processing on the device
+is the only honest answer.
+
+**3. Offline is a requirement.** Mobile apps in regions with spotty connectivity,
+or apps that need to work on a plane. On-device is the only reliable path.
+
+**4. Your model is small.** Quantized models can be 4-8 MB (a tiny vision
+transformer, a small BERT). At that size, the app bundle impact is negligible,
+and you avoid all server cost.
+
+**5. You're willing to accept version fragmentation.** A new model means a new
+app version. Your users update at different times. You run inference across
+multiple model versions in the wild. This is operationally messier but
+sometimes worth it.
+
+## The hybrid approach
+
+In practice, many teams split the difference:
+
+- **On-device for simple models.** Lightweight models (quantized, small) run on
+  the device — maybe embedding lookups, fast classifiers, preference inference.
+- **Server for complex models.** Larger models (your fine-tuned backbone) run on
+  the server.
+
+This gets you latency for the cheap operations and reliability for the
+expensive ones. It's more infrastructure, but it solves real trade-offs.
+
+## How to decide
+
+Run through this checklist:
+
+| Question | Leans toward... |
+|----------|---|
+| Must latency be <100ms? | On-device |
+| Must it work offline? | On-device |
+| Is privacy a hard requirement? | On-device |
+| Is the model >20 MB? | Server-side |
+| Do you need frequent updates? | Server-side |
+| Do you have modest request volume? | Server-side (cost) |
+| Are you in early development? | Server-side (speed) |
+
+Most columns light up for one side, you have your answer. If you're split, you
+probably want the hybrid.
+
+## The honest costs of each
+
+**Server-side has:**
+- ✓ Simple ops, one version, fast iteration
+- ✗ Latency, cost, privacy trade-off, not offline
+
+**On-device has:**
+- ✓ No latency, works offline, privacy-first
+- ✗ Large bundle, slow updates, device fragmentation, model complexity
+
+Neither is "better." They solve different problems. The wrong choice is not
+thinking through the trade-offs — and ending up building the thing you didn't
+need.
+
+## Conclusion
+
+TrichAi chose the server because the model was large, iteration speed mattered,
+and the latency trade-off wasn't a constraint. You might choose differently for
+a real-time app, or a privacy-sensitive one, or because your model is small
+enough to ship in the app. But the reasoning is the same: understand what
+matters for your use case, and pick the one that optimizes for it.
+
+For the technical details of *how* to serve an ONNX model on a server,
+[Production ML Workflows](/blog/production-workflows) covers the full stack.
+For exporting and optimizing the model itself, start with
+[Getting Started with ONNX](/blog/getting-started-onnx).
