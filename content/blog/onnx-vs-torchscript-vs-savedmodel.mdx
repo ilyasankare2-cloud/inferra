@@ -1,0 +1,131 @@
+---
+title: "Choosing a Model Format: ONNX vs TorchScript vs SavedModel"
+description: "Once a model is trained, how you serialize it shapes everything downstream. A practical comparison of ONNX, TorchScript, and TensorFlow SavedModel — portability, performance, and lock-in."
+date: "2026-05-19"
+tags: ["onnx", "deployment", "machine-learning", "inference"]
+---
+
+Training gets all the attention, but the format you serialize a model into
+quietly decides what your deployment looks like for years. Pick the wrong one and
+you're either locked into a framework, stuck on one runtime, or rewriting your
+serving stack later. This is a practical comparison of the three formats most
+teams actually choose between: **ONNX**, **TorchScript**, and **TensorFlow
+SavedModel**.
+
+## The one-line summary
+
+- **ONNX** — a framework-neutral interchange format. Train anywhere, run anywhere.
+- **TorchScript** — PyTorch's own serialization. Stays in the PyTorch world.
+- **SavedModel** — TensorFlow's native format. Stays in the TensorFlow world.
+
+The core tension is **portability vs. native fidelity**. The framework-native
+formats know every detail of their own models; ONNX trades a little of that for
+the freedom to run outside the framework entirely.
+
+## ONNX
+
+ONNX is an open format that represents a model as a framework-neutral
+computation graph. You export from PyTorch, TensorFlow, scikit-learn, and others
+into the same `.onnx` file, then run it with ONNX Runtime — which has no
+dependency on the original training framework.
+
+**Strengths:**
+
+- **True portability.** The runtime doesn't need PyTorch or TensorFlow
+  installed. Your production image is lean.
+- **One serving stack for many training frameworks.** Data scientists can use
+  PyTorch while serving stays uniform.
+- **Broad hardware reach** via execution providers — CPU, CUDA, TensorRT,
+  CoreML, and more from one artifact.
+
+**Weaknesses:**
+
+- **Export friction.** Exotic or custom operators may not have an ONNX
+  equivalent, so unusual models can fail to export cleanly.
+- **An extra step.** You train, then convert — and the conversion is a place
+  bugs can hide. Validate the exported graph.
+
+**Choose ONNX when:** you want to decouple training from serving, target diverse
+hardware, or keep your runtime framework-free. This is the format the rest of
+the [Inferra ONNX guides](/tags/onnx) are built around.
+
+## TorchScript
+
+TorchScript is PyTorch's native way to serialize a model into a form that runs
+without the Python interpreter, via two routes: **tracing** (run an example
+input, record the operations) and **scripting** (compile the Python directly).
+
+**Strengths:**
+
+- **No conversion to a foreign format.** It's still a PyTorch model, so
+  framework-specific behavior is preserved exactly.
+- **Handles dynamic control flow** well when you use scripting, which graph
+  exports sometimes struggle with.
+- **C++ deployment** via LibTorch, with no Python runtime.
+
+**Weaknesses:**
+
+- **PyTorch lock-in.** You're committed to the PyTorch/LibTorch runtime.
+- **Tracing pitfalls.** Tracing only records the path your example input took —
+  data-dependent branches that didn't execute won't be captured.
+
+**Choose TorchScript when:** you're all-in on PyTorch, want native fidelity, and
+don't need to run outside the PyTorch ecosystem.
+
+## TensorFlow SavedModel
+
+SavedModel is TensorFlow's complete serialization format — the graph, weights,
+and signatures in one directory. It's the native input to TensorFlow Serving,
+TFLite, and TensorFlow.js.
+
+**Strengths:**
+
+- **First-class in the TF ecosystem.** TensorFlow Serving, TFLite (mobile), and
+  TF.js (browser) all consume it directly.
+- **Self-contained.** Bundles everything needed to reload the model, including
+  named serving signatures.
+- **Mature serving story** with TensorFlow Serving for high-throughput setups.
+
+**Weaknesses:**
+
+- **TensorFlow lock-in.** The format is most useful inside the TF world.
+- **Heavier dependency** if all you need is to run a single model.
+
+**Choose SavedModel when:** you train in TensorFlow and deploy with TF Serving,
+TFLite, or TF.js.
+
+## Side by side
+
+| | ONNX | TorchScript | SavedModel |
+|---|---|---|---|
+| Origin | Open standard | PyTorch | TensorFlow |
+| Portability | High (any runtime) | PyTorch only | TF only |
+| Train framework | Many | PyTorch | TensorFlow |
+| Runtime dependency | ONNX Runtime | LibTorch | TF / TF Serving |
+| Hardware reach | Broad (EPs) | Good | Good |
+| Best for | Decoupled serving | PyTorch-native | TF-native |
+
+## A practical recommendation
+
+If you're starting fresh and value flexibility, **ONNX is the safest default**.
+It keeps your serving stack independent of your training choices, and if you
+migrate frameworks later, your deployment doesn't have to change. The cost is one
+export step and the occasional unsupported operator.
+
+Stay framework-native (TorchScript or SavedModel) when you're deeply invested in
+one ecosystem and rely on tooling that consumes its format directly — TF Serving
+for SavedModel, LibTorch C++ for TorchScript. The native fidelity and tooling
+integration are worth the lock-in when you've already committed to the
+ecosystem.
+
+## Conclusion
+
+There's no universally correct format — there's the one that fits your
+constraints. ONNX buys portability at the cost of an export step. TorchScript and
+SavedModel buy native fidelity and ecosystem tooling at the cost of lock-in. Map
+those trade-offs to where you actually deploy, and the choice makes itself.
+
+If ONNX is your pick, [Getting Started with ONNX](/blog/getting-started-onnx)
+covers the export and runtime, and
+[Choosing an ONNX Runtime Execution Provider](/blog/onnx-runtime-execution-providers)
+covers running it fast on your target hardware.

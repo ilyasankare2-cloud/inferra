@@ -1,0 +1,159 @@
+---
+title: "Batching Inference Requests: Throughput vs Latency"
+description: "Processing requests one at a time wastes hardware; batching them trades a little latency for a lot of throughput. How dynamic batching works, when it helps, and when a single shared session is enough."
+date: "2026-05-17"
+tags: ["inference", "optimization", "mlops", "production"]
+---
+
+There's a hardware truth that shapes ML serving: running a model on one input or
+on a batch of inputs often costs almost the same wall-clock time. Modern CPUs and
+GPUs are built for parallel work, so a model that classifies one image in 40ms
+might classify thirty-two images in 60ms. Process them one at a time and you've
+done 32 × 40ms of work. Batch them and you've done 60ms. That gap is what
+**batching** captures.
+
+But it's not free, and it's not always worth it. This guide covers when batching
+pays off, how dynamic batching works, and why plenty of services are right to
+skip it.
+
+## The core trade-off
+
+Batching trades **latency for throughput**:
+
+- **Throughput** (requests per second) goes *up* — you amortize fixed
+  per-inference overhead across many inputs.
+- **Latency** (time for one request) goes *up too* — a request may wait for the
+  batch to fill before it's processed.
+
+Whether that trade is good depends entirely on which one you're short on.
+
+## When batching helps
+
+**High request volume.** If requests arrive faster than you can serve them
+one-by-one, batching raises your ceiling. This is the classic case.
+
+**Expensive per-inference overhead.** Models with high fixed cost per call (large
+models, GPU kernel launch overhead) benefit most, because batching spreads that
+fixed cost.
+
+**Latency budget to spare.** If users tolerate, say, 200ms and a single
+inference takes 40ms, you have ~160ms of slack to wait for a batch. Spend it.
+
+## When batching does NOT help (and the single-session baseline)
+
+Here's the part most batching tutorials skip: **a lot of services don't need it.**
+
+If your traffic is modest — a handful of requests every few seconds — a single
+shared in-memory inference session already handles the load with low latency. ONNX
+Runtime's `Run()` is safe to call concurrently on one shared session, so parallel
+requests are served without reloading the model and without a queue:
+
+```python
+import onnxruntime as ort
+
+# One session, created once, shared across all requests.
+session = ort.InferenceSession("model.onnx", providers=["CPUExecutionProvider"])
+
+def predict(x):
+    # Safe to call concurrently from multiple requests.
+    return session.run(None, {"input": x})
+```
+
+For a service like this, adding a batching queue would *increase* latency (the
+wait to fill a batch) while solving a throughput problem you don't have. That's
+strictly worse. **Don't batch until measurement shows you're throughput-bound.**
+
+This is the same lesson as premature optimization everywhere: the single shared
+session is the baseline, and batching is what you add when — and only when — you
+outgrow it.
+
+## How dynamic batching works
+
+When you *are* throughput-bound, the standard technique is **dynamic batching**:
+incoming requests are collected for a short window, then run together.
+
+The two knobs:
+
+- **Max batch size** — the most requests to group at once.
+- **Max wait time** — how long a request waits for the batch to fill before
+  running anyway (so a lone request isn't stuck forever).
+
+A request is processed when *either* the batch is full *or* the wait time
+expires. Conceptually:
+
+```python
+import asyncio
+
+class DynamicBatcher:
+    def __init__(self, run_fn, max_batch=16, max_wait_ms=10):
+        self.run_fn = run_fn
+        self.max_batch = max_batch
+        self.max_wait = max_wait_ms / 1000
+        self.queue: list = []
+        self.lock = asyncio.Lock()
+
+    async def submit(self, item):
+        fut = asyncio.get_event_loop().create_future()
+        async with self.lock:
+            self.queue.append((item, fut))
+            if len(self.queue) >= self.max_batch:
+                await self._flush()
+        # otherwise a background timer flushes after max_wait
+        return await fut
+
+    async def _flush(self):
+        batch, self.queue = self.queue, []
+        if not batch:
+            return
+        inputs = [item for item, _ in batch]
+        results = self.run_fn(inputs)          # one batched inference
+        for (_, fut), result in zip(batch, results):
+            fut.set_result(result)
+```
+
+In production, prefer a battle-tested server that implements this for you —
+**NVIDIA Triton Inference Server** and **TorchServe** both offer dynamic batching
+out of the box. Rolling your own is instructive but easy to get subtly wrong
+(timeouts, error handling, backpressure).
+
+## Tuning the knobs
+
+There's no universal setting — it depends on your latency budget and traffic:
+
+- **Larger max batch** → higher throughput, higher worst-case latency.
+- **Longer max wait** → fuller batches, more latency added to every request.
+- **Shorter max wait** → snappier responses, smaller average batches.
+
+Start conservative (small batch, short wait), measure throughput and p99 latency,
+and widen only while you're within your latency budget.
+
+## Don't forget dynamic axes
+
+Batching only works if your model accepts variable batch sizes. If you exported
+with a fixed batch dimension, a batch of 16 will error. Export with a dynamic
+batch axis:
+
+```python
+torch.onnx.export(
+    model, dummy_input, "model.onnx",
+    input_names=["input"], output_names=["output"],
+    dynamic_axes={"input": {0: "batch"}, "output": {0: "batch"}},
+)
+```
+
+This is covered in [Getting Started with ONNX](/blog/getting-started-onnx) — and
+it's the most common reason a first batching attempt fails.
+
+## Conclusion
+
+Batching trades latency for throughput, and it's the right trade when you're
+genuinely throughput-bound and have latency budget to spend. But the honest
+starting point for most services is a single shared inference session — it's
+simpler, lower-latency, and enough until measurement proves otherwise. When you do
+need batching, reach for dynamic batching via Triton or TorchServe before rolling
+your own, and remember to export the model with a dynamic batch axis.
+
+For the serving architecture this sits inside, see
+[Production ML Workflows](/blog/production-workflows). To decide whether you're
+throughput-bound in the first place, you need numbers — see
+[Monitoring ML Models in Production](/blog/monitoring-ml-models).

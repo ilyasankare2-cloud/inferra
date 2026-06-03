@@ -9,6 +9,7 @@ export const site = {
   twitter: "@inferradev",
   navLinks: [
     { href: "/blog", label: "Blog" },
+    { href: "/tags", label: "Topics" },
     { href: "/about", label: "About" },
   ],
 } as const;

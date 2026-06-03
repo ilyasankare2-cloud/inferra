@@ -1,0 +1,160 @@
+---
+title: "Model Versioning and Rollback for ML Services"
+description: "Models change more often than code, and a bad model can be worse than a bug. A practical guide to versioning model artifacts and rolling back fast when a new model underperforms."
+date: "2026-05-18"
+tags: ["mlops", "production", "deployment", "machine-learning"]
+---
+
+Your code has git. What does your model have?
+
+For most ML services the answer is "nothing" — the model is a file that gets
+overwritten in object storage, and when a new version misbehaves there's no clean
+way back. That's a problem, because a model can degrade in ways a code review
+never catches: it trains on bad data, drifts from the validation set, or simply
+makes worse predictions in the real world. You need to version models like you
+version code, and roll back just as fast.
+
+## Why models need their own versioning
+
+A model artifact has properties that make it different from code:
+
+- **It's a binary blob**, not diffable text. You can't read a model and spot the
+  regression.
+- **Its quality is empirical**, not logical. "Correct" is a number on a
+  validation set, not a passing test.
+- **It changes independently of code.** You retrain on a schedule or on new
+  data, often without touching a line of the serving code.
+
+So model versioning has to be explicit and external. The good news: it's
+straightforward once you treat the artifact as a first-class, versioned thing.
+
+## Versioning the artifact
+
+The foundation: every model you deploy gets an **immutable, unique identifier**,
+and you never overwrite. The common patterns:
+
+### Versioned object storage keys
+
+If you load the model from object storage (S3, R2, GCS) — a pattern covered in
+[Production ML Workflows](/blog/production-workflows) — don't store it at a
+single mutable key like `model.onnx`. Store it under a versioned key:
+
+```
+models/classifier/v1/model.onnx
+models/classifier/v2/model.onnx
+models/classifier/v3/model.onnx
+```
+
+Then a small pointer says which version is live:
+
+```
+models/classifier/CURRENT  ->  "v2"
+```
+
+The service reads `CURRENT` at startup (or on a refresh signal) and loads that
+version. Rolling back is editing one pointer from `v3` to `v2` and restarting —
+the old artifact is still sitting there, untouched.
+
+### Track the metadata
+
+A version is more than a file. Record, alongside each artifact:
+
+```json
+{
+  "version": "v3",
+  "created": "2026-05-18T10:00:00Z",
+  "git_sha": "a1b2c3d",
+  "training_data": "dataset-2026-05-17",
+  "validation_accuracy": 0.94,
+  "notes": "retrain on May data"
+}
+```
+
+When something breaks at 2am, this metadata is how you answer "what changed?"
+without archaeology.
+
+## Exposing the version at runtime
+
+Make the running service tell you which model it's serving. A tiny addition that
+pays for itself the first time you debug a discrepancy:
+
+```python
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "model_version": classifier.version,
+        "model_loaded": classifier.is_ready(),
+    }
+```
+
+Now you can confirm, instantly, whether a deployed instance is on the version you
+think it is — instead of guessing.
+
+## Rolling back
+
+The whole point of versioning is that rollback becomes boring. When a new model
+underperforms:
+
+1. **Detect** — monitoring or user reports flag the regression. (Detecting it is
+   its own discipline; see
+   [Monitoring ML Models in Production](/blog/monitoring-ml-models).)
+2. **Repoint** — change the `CURRENT` pointer back to the last known-good
+   version.
+3. **Reload** — restart the service, or trigger a model refresh if your service
+   supports hot-reloading.
+4. **Investigate** — with traffic safely back on the good model, dig into why the
+   new one regressed.
+
+Because you never overwrote `v2`, the rollback is a pointer change and a restart
+— seconds to minutes, not a frantic retrain.
+
+## Gating new models before they go live
+
+Rollback is the safety net. The gate is what keeps you off it. Before a new model
+becomes `CURRENT`, it should have to **beat the current one** on a fixed
+evaluation set:
+
+```python
+import sys
+
+new_acc = evaluate(new_model, validation_set)
+current_acc = evaluate(current_model, validation_set)
+
+print(f"new={new_acc:.4f} current={current_acc:.4f}")
+if new_acc < current_acc - 0.005:  # small tolerance for noise
+    print("New model is worse — refusing to promote.")
+    sys.exit(1)
+```
+
+This is the same idea as a failing test blocking a deploy, applied to models. It
+turns "we shipped a worse model and didn't notice" into "the pipeline refused to
+ship it." More on automating this in
+[ML Automation for Developers](/blog/ml-automation).
+
+## A note on hot-reloading vs restart
+
+Two ways to pick up a new (or rolled-back) version:
+
+- **Restart** — simplest. The service reads the pointer on boot. Rollback =
+  repoint + restart. Fine for most services; a few seconds of downtime or a
+  rolling restart.
+- **Hot-reload** — the service watches the pointer and swaps the in-memory
+  session without restarting. Zero downtime, more complexity. Worth it only when
+  restarts are genuinely costly.
+
+Start with restart. Add hot-reload when you've measured that restart downtime
+actually hurts.
+
+## Conclusion
+
+Treat model artifacts like code: immutable versions, never overwritten, with a
+pointer to what's live and metadata describing each one. That single discipline
+turns a model regression from a crisis into a pointer change. Pair it with an
+evaluation gate so worse models rarely go live, and a `/health` endpoint that
+reports the running version so you always know what's serving.
+
+For the storage-and-serving architecture this builds on, see
+[Production ML Workflows](/blog/production-workflows). For catching the
+regressions that trigger a rollback, see
+[Monitoring ML Models in Production](/blog/monitoring-ml-models).

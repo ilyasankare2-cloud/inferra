@@ -1,0 +1,151 @@
+---
+title: "Monitoring ML Models in Production: Drift, Logging, and Alerts"
+description: "A model that passed every test can still rot in production as the world changes. What to monitor for an ML service — latency, data drift, prediction drift — and how to start when you have zero instrumentation today."
+date: "2026-05-16"
+tags: ["mlops", "monitoring", "production", "machine-learning"]
+---
+
+A traditional service breaks loudly: it throws, it 500s, it pages you. An ML
+service has a second, quieter failure mode — it keeps returning confident,
+well-formed predictions that are slowly becoming *wrong*. The code is fine. The
+model is fine. The world changed, and the model didn't. Without monitoring, you
+find out from user complaints, weeks late.
+
+This guide covers what to monitor for an ML service and, crucially, how to start
+from nothing — because most services begin with **no instrumentation at all.**
+
+## Starting from zero
+
+Be honest about the common baseline: many production ML services run with
+effectively no monitoring. Error tracking might be installed but with tracing
+sampled at zero, so there are no latency traces. There's no drift detection, no
+prediction logging. The service works, so nobody instrumented it.
+
+That's a fine place to *start* — but it means the first job isn't fancy drift
+math. It's **turning on the most basic measurement.** You can't improve, alert
+on, or even reason about what you don't record. Everything below is ordered so
+you can start at step one today.
+
+## Step 1: Operational metrics (do this first)
+
+Before any ML-specific monitoring, capture what you'd capture for any service.
+This is the highest value-to-effort ratio by far.
+
+- **Latency** — p50, p95, p99 of inference time. Not just an average; the tail is
+  where users suffer.
+- **Throughput** — requests per second.
+- **Error rate** — failed requests, timeouts, malformed inputs.
+- **Resource use** — CPU, memory. (Memory matters: each worker holds a copy of
+  the model.)
+
+The simplest possible start is logging timing around the inference call:
+
+```python
+import time, logging
+
+logger = logging.getLogger("inference")
+
+def predict(x):
+    start = time.perf_counter()
+    result = session.run(None, {"input": x})
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    logger.info("inference", extra={"latency_ms": round(elapsed_ms, 1)})
+    return result
+```
+
+That one log line is the difference between "I think it's fast enough" and "p99 is
+180ms." If you use an error tracker like Sentry, raise its trace sample rate above
+zero so you actually capture performance data. Measurement first — it's the
+prerequisite for every optimization discussed in the
+[Inferra production guides](/tags/production).
+
+## Step 2: Log predictions
+
+Once operational metrics exist, start recording what the model actually predicts.
+For each request, log (with appropriate privacy care): the prediction, the
+confidence, and a timestamp.
+
+```python
+logger.info("prediction", extra={
+    "label": result["label"],
+    "confidence": result["confidence"],
+})
+```
+
+This unlocks the next step. Without a record of predictions over time, you can't
+detect drift — you'd have nothing to compare against.
+
+## Step 3: Watch for prediction drift
+
+**Prediction drift** is a shift in the *distribution of your model's outputs*
+over time. It needs no ground-truth labels, which makes it the most practical
+drift signal to start with.
+
+If a 4-class classifier normally predicts roughly `{A: 40%, B: 30%, C: 20%, D:
+10%}` and this week it's predicting `{A: 75%, ...}`, something changed — the input
+distribution, the data pipeline, or the world. You don't yet know it's *wrong*,
+but you know it's *different*, and different is worth a look.
+
+Compute the class distribution over a rolling window and compare it to a
+reference (e.g. the training distribution). A simple population-stability check or
+a chi-squared test over the buckets is enough to start.
+
+## Step 4: Watch for data drift
+
+**Data drift** is a shift in the *inputs* themselves. For images: average
+brightness, resolution, aspect ratios. For tabular data: the mean and variance of
+each feature. When inputs move away from what the model trained on, accuracy
+quietly degrades even if predictions still look plausible.
+
+You don't need a heavyweight platform to begin — tracking a few summary
+statistics of inputs over time catches gross shifts (a new camera, a changed
+upstream pipeline, a different user population). Tools like **Evidently** or
+**NannyML** formalize this when you're ready.
+
+## Step 5: Alert on what matters
+
+Monitoring nobody looks at is just storage. Turn the signals into alerts —
+sparingly, so they stay meaningful:
+
+- **Latency:** p99 exceeds your budget.
+- **Errors:** error rate crosses a threshold.
+- **Prediction drift:** output distribution diverges from reference past a bound.
+- **Confidence collapse:** average confidence drops sharply (often the earliest
+  visible symptom of input problems).
+
+Alert only on things you would actually act on. An alert that fires and gets
+ignored trains you to ignore alerts.
+
+## The honest progression
+
+You don't build all of this at once. The order *is* the advice:
+
+1. **Operational metrics** — latency, errors, throughput. Start here, today.
+2. **Prediction logging** — record outputs so drift detection is possible later.
+3. **Prediction drift** — no labels needed, high signal.
+4. **Data drift** — catch input shifts before they hurt accuracy.
+5. **Alerting** — make the signals actionable.
+
+A service at step one is dramatically better off than a service at step zero.
+Don't skip to drift dashboards while you still can't quote your p99.
+
+## Why this closes the loop
+
+Monitoring is what makes the rest of your ML lifecycle real. It's the **detect**
+that triggers a [rollback](/blog/model-versioning-and-rollback). It's the
+evidence that tells you whether to [quantize](/blog/quantizing-onnx-models) or
+[batch](/blog/batching-inference-requests). It's the trigger for automated
+retraining in [ML Automation for Developers](/blog/ml-automation). Without
+measurement, every other decision is a guess.
+
+## Conclusion
+
+ML services fail silently, so monitoring isn't optional — but it is something you
+build up, not all at once. Start with operational metrics today: log inference
+latency and turn your error tracker's sampling above zero. Add prediction logging,
+then prediction drift, then data drift, then alerts. The goal isn't a perfect
+observability stack on day one; it's never again finding out from a user that your
+model quietly stopped working.
+
+For where monitoring fits in the full serving picture, see
+[Production ML Workflows](/blog/production-workflows).

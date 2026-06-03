@@ -4,7 +4,7 @@ import { notFound } from "next/navigation";
 import { MDXRemote } from "next-mdx-remote/rsc";
 import rehypeSlug from "rehype-slug";
 import rehypeHighlight from "rehype-highlight";
-import { getAllPosts, getPostBySlug, getRelatedPosts } from "@/lib/posts";
+import { getAllPosts, getPostBySlug, getRelatedPosts, tagSlug } from "@/lib/posts";
 import { formatDate } from "@/lib/format";
 import { site } from "@/lib/site";
 import { CodeBlock } from "@/components/CodeBlock";
@@ -112,9 +112,9 @@ export default async function BlogPostPage({
           {post.tags.length > 0 && (
             <div className="tag-row">
               {post.tags.map((tag) => (
-                <span key={tag} className="tag">
+                <Link key={tag} href={`/tags/${tagSlug(tag)}`} className="tag tag-link">
                   {tag}
-                </span>
+                </Link>
               ))}
             </div>
           )}
