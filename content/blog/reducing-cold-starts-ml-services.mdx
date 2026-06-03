@@ -1,0 +1,135 @@
+---
+title: "Reducing Cold Starts in Containerized ML Services"
+description: "When your service loads a model from object storage at boot, cold starts get slow. Why ML services start slowly, and the practical levers — image size, lazy loading, warm instances, and model size — to fix it."
+date: "2026-05-14"
+tags: ["mlops", "production", "deployment", "optimization"]
+---
+
+A cold start is the time between "the platform decides to run your service" and
+"your service can answer a request." For a typical web app that's milliseconds.
+For an ML service that downloads a model from object storage and loads it into
+memory, it can be many seconds — and those seconds land on a real user if your
+service scales from zero or restarts under load.
+
+This guide breaks down where ML cold-start time actually goes and the levers that
+shorten it.
+
+## Where the time goes
+
+An ML service cold start is usually four phases stacked end to end:
+
+1. **Container scheduling** — the platform allocates and starts the container.
+2. **Image pull** — if not cached, the registry pulls your image.
+3. **Model download** — fetching the model artifact from object storage (S3, R2,
+   GCS).
+4. **Model load** — building the inference session in memory (parsing the graph,
+   allocating buffers).
+
+For a service that loads its model from storage at boot — a common and otherwise
+excellent pattern from [Production ML Workflows](/blog/production-workflows) —
+phases 3 and 4 dominate. An ~80 MB model is tens of MB to move and a measurable
+moment to initialize.
+
+## Lever 1: shrink the model
+
+The download scales with model size, so the highest-leverage fix is a smaller
+model. INT8 quantization cuts a float32 model by roughly 4× — an ~80 MB model
+drops to ~20 MB, and the cold-start download drops with it:
+
+```python
+from onnxruntime.quantization import quantize_dynamic, QuantType
+
+quantize_dynamic("model.onnx", "model.int8.onnx", weight_type=QuantType.QInt8)
+```
+
+This is a two-for-one: smaller artifact *and* faster CPU inference. The trade-off
+is accuracy, which you must measure — the full reasoning is in
+[Quantizing ONNX Models](/blog/quantizing-onnx-models).
+
+## Lever 2: keep the image small
+
+A bloated image makes phase 2 (image pull) slow whenever the layer cache is cold.
+A lean image pulls fast. The essentials:
+
+- Multi-stage build, `slim` base, `.dockerignore`.
+- Install CPU-only `onnxruntime`, not the much larger `onnxruntime-gpu`, unless
+  you actually serve on a GPU.
+- **Don't bake the model into the image** — keep loading it from storage so the
+  image stays small and the model versions independently.
+
+All of this is covered in
+[Containerizing a FastAPI ML Service](/blog/dockerizing-fastapi-ml-service).
+
+## Lever 3: don't scale to zero (if cold starts hurt)
+
+Scale-to-zero saves money by killing idle instances — but the next request pays
+the full cold start. If that latency is unacceptable, **keep at least one warm
+instance running.** You trade a little cost for never serving a cold start to a
+user. Most platforms expose a "minimum instances" setting for exactly this.
+
+The decision is a cost/latency trade: a low-traffic hobby project can tolerate
+scale-to-zero; a user-facing product usually shouldn't.
+
+## Lever 4: load the model once, share it
+
+Make sure the (slow) model load happens **once at startup**, not per request. A
+single shared `InferenceSession` reused across requests means you pay the load
+cost one time per instance, not on every call:
+
+```python
+# At startup — once.
+session = ort.InferenceSession("model.onnx", providers=["CPUExecutionProvider"])
+```
+
+If you accidentally construct the session inside the request handler, every
+request becomes a cold start. This is the same shared-session principle behind
+[Batching Inference Requests](/blog/batching-inference-requests).
+
+## Lever 5: warm readiness, not false readiness
+
+Make your readiness probe report ready only **after** the model is loaded, so the
+platform doesn't route traffic to an instance that's still initializing:
+
+```python
+@app.get("/health")
+def health():
+    return {"status": "ok", "model_loaded": classifier.is_ready()}
+```
+
+Without this, the first requests after a deploy hit an instance whose model
+hasn't finished loading — and they fail. Covered alongside other container
+practices in [the containerization guide](/blog/dockerizing-fastapi-ml-service).
+
+## Lever 6: cache the model on a persistent volume
+
+If your platform offers persistent storage, cache the downloaded model there so a
+restart reuses the local copy instead of re-downloading from object storage. On a
+restart, the service checks the volume first and only fetches from storage on a
+cache miss. This turns phase 3 from "download tens of MB" into "read a local
+file" on most restarts.
+
+## Putting it together
+
+A practical priority order, biggest win first:
+
+1. **Quantize** to shrink the model (helps download *and* inference).
+2. **Keep the image lean** so pulls are fast.
+3. **Keep one warm instance** if cold starts reach users.
+4. **Load once, share the session**, and gate readiness on the model being
+   loaded.
+5. **Cache on a persistent volume** if your platform supports it.
+
+You won't need all of these. Measure your cold start, find which phase dominates,
+and apply the lever that targets it.
+
+## Conclusion
+
+ML cold starts are slow because of two phases other services don't have:
+downloading and loading a model. Attack the dominant one — usually that means a
+smaller (quantized) model and a lean image, plus a warm instance when the latency
+genuinely reaches users. As always, measure first: the right lever is the one
+that targets your actual bottleneck.
+
+For shrinking the model, see
+[Quantizing ONNX Models](/blog/quantizing-onnx-models). For the container itself,
+see [Containerizing a FastAPI ML Service](/blog/dockerizing-fastapi-ml-service).

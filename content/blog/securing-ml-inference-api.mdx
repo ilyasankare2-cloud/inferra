@@ -1,0 +1,176 @@
+---
+title: "Securing an ML Inference API: Validation and Abuse Prevention"
+description: "An ML endpoint that accepts file uploads is an attack surface. Practical hardening for inference APIs — input validation, size and rate limits, and the defenses that matter before you take traffic."
+date: "2026-05-15"
+tags: ["security", "fastapi", "production", "mlops"]
+---
+
+An inference endpoint that accepts an uploaded image is, from a security
+standpoint, a service that lets strangers send arbitrary bytes to your server and
+trigger expensive computation. That's not a reason to panic — it's a reason to
+validate at the boundary. This guide covers the practical hardening that belongs
+on any ML API before it sees real traffic.
+
+## The threat model
+
+Be concrete about what can go wrong when anyone can POST to `/analyze`:
+
+- **Resource exhaustion** — huge files, or a flood of requests, exhaust memory,
+  CPU, or your bill.
+- **Malformed input** — corrupt or hostile files crash the decoder or the model.
+- **Decompression bombs** — a tiny file that expands to gigabytes when decoded.
+- **Abuse / scraping** — someone runs your model as their free API.
+
+None of these are exotic. All of them are cheap to defend against.
+
+## Validate at the boundary
+
+The single most important principle: untrusted input gets checked **before** it
+reaches the model. The endpoint is the only door, so it's where the locks go.
+
+### Enforce content type and size
+
+Check the declared type and cap the size before reading the whole body into
+memory:
+
+```python
+from fastapi import FastAPI, UploadFile, File, HTTPException
+
+app = FastAPI()
+ALLOWED = {"image/jpeg", "image/png", "image/webp"}
+MAX_BYTES = 10 * 1024 * 1024  # 10 MB
+
+@app.post("/analyze")
+async def analyze(file: UploadFile = File(...)):
+    if file.content_type not in ALLOWED:
+        raise HTTPException(415, "Unsupported media type")
+
+    data = await file.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise HTTPException(413, "File too large")
+    ...
+```
+
+Reading `MAX_BYTES + 1` means you stop *before* pulling an unbounded body into
+memory — you never trust the client's declared length.
+
+### Don't trust the content type — verify the bytes
+
+A client can claim `image/png` and send anything. Confirm the file really is the
+image it claims by validating it with your image library, and treat a decode
+failure as a rejection, not a crash:
+
+```python
+import io
+from PIL import Image
+
+try:
+    img = Image.open(io.BytesIO(data))
+    img.verify()                 # structural check
+    img = Image.open(io.BytesIO(data))  # re-open to actually use
+except Exception:
+    raise HTTPException(422, "Invalid or corrupt image")
+```
+
+### Defend against decompression bombs
+
+A 50 KB PNG can decode to a 25,000×25,000 image that eats gigabytes. Pillow has a
+guard (`MAX_IMAGE_PIXELS`) that raises on absurd dimensions — keep it enabled, and
+add your own explicit dimension cap:
+
+```python
+MAX_DIM = 8000
+if img.width > MAX_DIM or img.height > MAX_DIM:
+    raise HTTPException(422, "Image dimensions too large")
+```
+
+Since the model resizes everything to 224×224 anyway (see
+[Preprocessing Mismatch](/blog/preprocessing-mismatch)), there's no legitimate
+reason to accept a 25-megapixel upload.
+
+## Rate limiting
+
+Validation stops bad *requests*; rate limiting stops too *many* requests. Without
+it, one client can saturate your CPU-bound inference and deny service to everyone
+else. A simple per-IP limit covers most of the risk:
+
+```python
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
+
+@app.post("/analyze")
+@limiter.limit("30/minute")
+async def analyze(...):
+    ...
+```
+
+For anything serious, enforce limits at the edge too (your platform's WAF or a
+reverse proxy) so the abusive traffic never reaches your app.
+
+## CORS: don't use a wildcard
+
+If a browser app calls your API, configure CORS for *your* origins — not `*`. A
+wildcard lets any website on the internet call your API from a user's browser:
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["https://yourapp.com"],  # not "*"
+    allow_methods=["POST"],
+    allow_headers=["*"],
+)
+```
+
+## Don't leak internals in errors
+
+A stack trace in a 500 response hands an attacker a map of your system. Return a
+generic message to the client and log the detail server-side:
+
+```python
+@app.exception_handler(Exception)
+async def on_error(request, exc):
+    logger.exception("unhandled error")          # full detail in logs
+    return JSONResponse(status_code=500,
+                        content={"error": "Internal error"})  # generic to client
+```
+
+## Secrets stay in the environment
+
+Your R2/S3 keys, any API tokens — none of them belong in the code or the image.
+Read them from environment variables, keep them out of git (`.env` in
+`.gitignore`), and set them in your platform's secret manager. A model loaded
+from object storage (the pattern in
+[Production ML Workflows](/blog/production-workflows)) needs credentials; those
+credentials must never land in a commit or a Docker layer.
+
+## A pre-traffic checklist
+
+Before an inference API takes real traffic:
+
+- Content-type allowlist ✓
+- Size cap enforced before full read ✓
+- Bytes verified as a real image, decode failures handled ✓
+- Dimension / pixel cap against decompression bombs ✓
+- Per-IP rate limiting ✓
+- CORS restricted to your origins ✓
+- Generic error responses, detailed server logs ✓
+- Secrets in env vars, never in code or image ✓
+- Run the container as non-root (see
+  [Containerizing a FastAPI ML Service](/blog/dockerizing-fastapi-ml-service)) ✓
+
+## Conclusion
+
+Securing an ML API isn't about exotic ML-specific attacks — it's web security
+fundamentals applied to an endpoint that happens to run a model: validate input
+at the boundary, cap size and dimensions, rate-limit, lock down CORS, hide
+internal errors, and keep secrets in the environment. Do these before you take
+traffic, not after the first incident.
+
+For the container hardening that complements this, see
+[Containerizing a FastAPI ML Service](/blog/dockerizing-fastapi-ml-service). For
+the serving architecture it protects, see
+[Production ML Workflows](/blog/production-workflows).
